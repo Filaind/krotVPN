@@ -1,0 +1,55 @@
+name: Release
+
+# Tag a commit to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build release artifacts
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME}"
+          CMDS="krot-server krot-client krot-keygen krotctl"
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist
+
+          for ARCH in amd64 arm64; do
+            OUT="krot-${VERSION}-linux-${ARCH}"
+            mkdir -p "build/${OUT}"
+            for c in $CMDS; do
+              echo "building $c for linux/$ARCH"
+              GOOS=linux GOARCH="$ARCH" CGO_ENABLED=0 \
+                go build -trimpath -ldflags="${LDFLAGS}" \
+                -o "build/${OUT}/${c}" "./cmd/${c}"
+            done
+            # bundle example configs, systemd units and README for convenience
+            cp -r configs deploy README.md "build/${OUT}/" 2>/dev/null || true
+            tar -C build -czf "dist/${OUT}.tar.gz" "${OUT}"
+            echo "packed dist/${OUT}.tar.gz"
+          done
+
+          ( cd dist && sha256sum *.tar.gz > SHA256SUMS.txt )
+          echo "---- artifacts ----"; ls -la dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: krotVPN ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt

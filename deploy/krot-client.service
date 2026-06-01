@@ -1,0 +1,16 @@
+[Unit]
+Description=Krot VPN client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/krot-client -config /etc/krot/client.json
+Restart=on-failure
+RestartSec=3
+# Needs to create TUN devices and rewrite routes/resolv.conf:
+AmbientCapabilities=CAP_NET_ADMIN
+# (Or run as root by removing the line above.)
+
+[Install]
+WantedBy=multi-user.target

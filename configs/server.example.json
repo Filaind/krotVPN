@@ -1,0 +1,16 @@
+{
+  "listen": ":443",
+  "sni": "your-domain.example",
+  "path": "/api/v2/REPLACE_WITH_SECRET",
+  "psk": "REPLACE_WITH_KEYGEN_PSK",
+  "server_priv": "REPLACE_WITH_KEYGEN_SERVER_PRIV",
+  "cert_file": "/etc/letsencrypt/live/your-domain.example/fullchain.pem",
+  "key_file": "/etc/letsencrypt/live/your-domain.example/privkey.pem",
+  "self_signed": false,
+  "decoy": "https://www.wikipedia.org",
+  "tun_name": "krot0",
+  "tun_cidr": "10.8.0.1/24",
+  "dns": "1.1.1.1",
+  "wan_iface": "",
+  "mtu": 1380
+}

@@ -1,0 +1,11 @@
+[Interface]
+PrivateKey = +JFYv0UUTopFfcsZYaHCRMCZ+Wo1KVlzTdo7UHqjHF0=
+Address = 10.7.0.2/32
+DNS = 1.1.1.1
+MTU = 1340
+
+[Peer]
+PublicKey = iPQBkpxMb/ddH6ZgNVEDRMP7ykL5gdN1AGw+I5YE904=
+Endpoint = 192.168.1.85:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25

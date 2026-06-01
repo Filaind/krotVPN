@@ -1,0 +1,13 @@
+{
+  "server_ip": "YOUR.SERVER.IP.ADDR",
+  "server_port": 443,
+  "sni": "your-domain.example",
+  "path": "/api/v2/REPLACE_WITH_SECRET",
+  "psk": "REPLACE_WITH_KEYGEN_PSK",
+  "server_pub": "REPLACE_WITH_KEYGEN_SERVER_PUB",
+  "insecure": false,
+  "pin_sha256": "",
+  "tun_name": "krot0",
+  "mtu": 1380,
+  "dns": ""
+}

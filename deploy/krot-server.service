@@ -1,0 +1,17 @@
+[Unit]
+Description=Krot VPN server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/krot-server -config /etc/krot/server.json
+Restart=on-failure
+RestartSec=3
+# Needs to create TUN devices and edit iptables:
+AmbientCapabilities=CAP_NET_ADMIN
+# (Or simply run as root by removing the two lines above and the User= line.)
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

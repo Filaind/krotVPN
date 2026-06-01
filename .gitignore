@@ -1,0 +1,12 @@
+# build artifacts
+/bin/
+/dist/
+/build/
+
+# local configs with secrets (keep *.example.json)
+configs/*.live.json
+*.local.json
+
+# editor / OS
+.DS_Store
+*.swp
