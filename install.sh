@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# krotVPN installer — fetch the latest GitHub release, install the binaries
+# into /usr/local/bin and launch krotctl.
+#
+# Quick start (paste into a terminal):
+#   curl -fsSL https://raw.githubusercontent.com/Filaind/krotVPN/main/install.sh | sudo bash
+#
+# Options (via environment variables):
+#   KROT_VERSION=v0.1.0   pin a specific release tag (default: latest)
+#   KROT_BINDIR=/path     install dir                 (default: /usr/local/bin)
+#   KROT_NO_RUN=1         install only, do not launch krotctl
+set -euo pipefail
+
+REPO="Filaind/krotVPN"
+BINDIR="${KROT_BINDIR:-/usr/local/bin}"
+VERSION="${KROT_VERSION:-}"
+
+say()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- platform check -----------------------------------------------------------
+[ "$(uname -s)" = "Linux" ] || die "krot server/client run on Linux only (got $(uname -s))."
+
+case "$(uname -m)" in
+  x86_64|amd64)  ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  *) die "unsupported architecture: $(uname -m) (need amd64 or arm64)." ;;
+esac
+
+for tool in curl tar; do
+  command -v "$tool" >/dev/null 2>&1 || die "'$tool' is required but not installed."
+done
+
+# --- resolve the release tag --------------------------------------------------
+if [ -z "$VERSION" ]; then
+  say "Resolving latest release of $REPO ..."
+  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+  [ -n "$VERSION" ] || die "could not determine the latest release tag."
+fi
+say "Installing krotVPN $VERSION (linux/$ARCH)"
+
+# --- download + verify --------------------------------------------------------
+TARBALL="krot-${VERSION}-linux-${ARCH}.tar.gz"
+BASE="https://github.com/${REPO}/releases/download/${VERSION}"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+say "Downloading $TARBALL ..."
+curl -fSL --progress-bar -o "$TMP/$TARBALL" "$BASE/$TARBALL" \
+  || die "download failed: $BASE/$TARBALL"
+
+if curl -fsSL -o "$TMP/SHA256SUMS.txt" "$BASE/SHA256SUMS.txt" 2>/dev/null; then
+  say "Verifying checksum ..."
+  ( cd "$TMP" && sha256sum -c SHA256SUMS.txt --ignore-missing ) \
+    || die "checksum verification failed."
+else
+  warn "SHA256SUMS.txt not found in release — skipping checksum verification."
+fi
+
+# --- install ------------------------------------------------------------------
+tar -C "$TMP" -xzf "$TMP/$TARBALL"
+SRC="$TMP/krot-${VERSION}-linux-${ARCH}"
+
+say "Installing binaries into $BINDIR (may require sudo) ..."
+if [ -w "$BINDIR" ] || [ "$(id -u)" = 0 ]; then
+  install -m 0755 "$SRC"/krot-server "$SRC"/krot-client "$SRC"/krot-keygen "$SRC"/krotctl "$BINDIR/"
+else
+  sudo install -m 0755 "$SRC"/krot-server "$SRC"/krot-client "$SRC"/krot-keygen "$SRC"/krotctl "$BINDIR/"
+fi
+
+say "Installed: krot-server krot-client krot-keygen krotctl -> $BINDIR"
+"$BINDIR/krotctl" version || true
+
+# --- launch -------------------------------------------------------------------
+if [ "${KROT_NO_RUN:-}" = "1" ]; then
+  say "Done. Run 'krotctl' to start the interactive setup wizard."
+  exit 0
+fi
+
+say "Launching krotctl setup wizard ..."
+if [ "$(id -u)" = 0 ]; then
+  exec "$BINDIR/krotctl" "$@"
+else
+  exec sudo "$BINDIR/krotctl" "$@"
+fi

@@ -105,6 +105,18 @@ deploy/             systemd-юниты
 
 ## Установка
 
+### Быстрая установка (одной командой)
+
+Качает последний релиз, ставит бинарники в `/usr/local/bin` и запускает мастер
+настройки `krotctl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Filaind/krotVPN/main/install.sh | sudo bash
+```
+
+Переменные окружения: `KROT_VERSION=v0.1.0` — закрепить версию, `KROT_BINDIR`
+— каталог установки, `KROT_NO_RUN=1` — только установить, не запускать мастер.
+
 ### Готовые бинарники (релизы)
 
 Каждый git-тег `v*` автоматически собирается через GitHub Actions в архивы под
