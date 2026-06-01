@@ -16,6 +16,7 @@ import (
 )
 
 const (
+	krotConfigDir  = "/etc/krot"
 	serverCfgPath  = "/etc/krot/server.json"
 	serverUnit     = "krot-server"
 	serverUnitPath = "/etc/systemd/system/krot-server.service"

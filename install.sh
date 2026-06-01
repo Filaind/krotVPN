@@ -5,9 +5,13 @@
 # Quick start (paste into a terminal):
 #   curl -fsSL https://raw.githubusercontent.com/Filaind/krotVPN/main/install.sh | sudo bash
 #
+# Besides installing into the system path, it drops a ./krotctl copy into the
+# directory you run it from, so you can later do e.g. `sudo ./krotctl uninstall`.
+#
 # Options (via environment variables):
 #   KROT_VERSION=v0.1.0   pin a specific release tag (default: latest)
-#   KROT_BINDIR=/path     install dir                 (default: /usr/local/bin)
+#   KROT_BINDIR=/path     system install dir          (default: /usr/local/bin)
+#   KROT_LOCAL_DIR=/path  where to drop ./krotctl     (default: current dir)
 #   KROT_NO_RUN=1         install only, do not launch krotctl
 set -euo pipefail
 
@@ -71,11 +75,25 @@ else
 fi
 
 say "Installed: krot-server krot-client krot-keygen krotctl -> $BINDIR"
+
+# Also drop a krotctl copy into the directory the script was invoked from, so
+# you can run it as ./krotctl (e.g. ./krotctl uninstall) without relying on PATH.
+LOCAL_DIR="${KROT_LOCAL_DIR:-$PWD}"
+if [ -d "$LOCAL_DIR" ] && [ "$(cd "$LOCAL_DIR" && pwd)" != "$BINDIR" ]; then
+  if install -m 0755 "$SRC/krotctl" "$LOCAL_DIR/krotctl" 2>/dev/null; then
+    # Keep it owned by the user who invoked sudo, not root.
+    [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER" "$LOCAL_DIR/krotctl" 2>/dev/null || true
+    say "Local copy: $LOCAL_DIR/krotctl  (run e.g. 'sudo ./krotctl uninstall')"
+  else
+    warn "Could not write a local krotctl copy to $LOCAL_DIR (use the one in $BINDIR)."
+  fi
+fi
+
 "$BINDIR/krotctl" version || true
 
 # --- launch -------------------------------------------------------------------
 if [ "${KROT_NO_RUN:-}" = "1" ]; then
-  say "Done. Run 'krotctl' to start the interactive setup wizard."
+  say "Done. Run 'krotctl' (or './krotctl') to start the interactive setup wizard."
   exit 0
 fi
 

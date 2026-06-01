@@ -10,6 +10,7 @@
 //	krotctl server run  -config <path>      run in foreground (systemd calls this)
 //	krotctl server status                   show service / TUN / NAT state
 //	krotctl server down                     stop service + revert networking
+//	krotctl uninstall [flags]               remove everything krot installed
 //
 // Most commands need root (TUN, iptables, systemd).
 package main
@@ -42,6 +43,8 @@ func main() {
 		err = cmdServer(os.Args[2:])
 	case "client":
 		err = cmdClient(os.Args[2:])
+	case "uninstall", "purge", "remove":
+		err = cmdUninstall(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Printf("krotctl %s (krot VPN)\n", version)
 	case "help", "-h", "--help":
@@ -101,6 +104,13 @@ Commands:
   client status [-name N]  Show instance service, TUN, SOCKS, source rule.
   client down  [-name N]   Stop the instance and revert its routing/TUN.
 
+  uninstall [flags]        Completely remove krot: stop + disable the server and
+                           all client instances (reverting TUN/NAT/routing),
+                           delete systemd units, /etc/krot, and the binaries.
+    -yes                   skip the confirmation prompt
+    -keep-config           leave /etc/krot (configs + secrets) in place
+    -keep-binaries         leave the krot* binaries in place
+
 Examples:
   sudo krotctl server up -sni en.wikipedia.org -decoy https://en.wikipedia.org
   sudo krotctl client up -mode full   -server 46.224.77.233 -sni en.wikipedia.org \
@@ -109,5 +119,7 @@ Examples:
        -sni en.wikipedia.org -path /api/v2/xxx -psk <b64> -server-pub <b64> \
        -socks 127.0.0.1:1080
   sudo krotctl client status -name xray
+  sudo krotctl uninstall            # full removal (asks for confirmation)
+  sudo krotctl uninstall -yes -keep-binaries
 `)
 }
