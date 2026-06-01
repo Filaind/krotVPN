@@ -79,9 +79,18 @@ if [ "${KROT_NO_RUN:-}" = "1" ]; then
   exit 0
 fi
 
+# When this script is run via `curl ... | bash`, stdin is the pipe from curl,
+# not the terminal — so krotctl's wizard would read EOF and silently accept all
+# defaults. Reconnect stdin to the controlling terminal so prompts work.
+if [ ! -t 0 ] && [ ! -e /dev/tty ]; then
+  warn "No interactive terminal available — skipping the wizard."
+  say "Run 'sudo krotctl' yourself to configure interactively."
+  exit 0
+fi
+
 say "Launching krotctl setup wizard ..."
 if [ "$(id -u)" = 0 ]; then
-  exec "$BINDIR/krotctl" "$@"
+  exec "$BINDIR/krotctl" "$@" < /dev/tty
 else
-  exec sudo "$BINDIR/krotctl" "$@"
+  exec sudo "$BINDIR/krotctl" "$@" < /dev/tty
 fi
