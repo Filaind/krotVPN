@@ -39,9 +39,14 @@ done
 # --- resolve the release tag --------------------------------------------------
 if [ -z "$VERSION" ]; then
   say "Resolving latest release of $REPO ..."
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-  [ -n "$VERSION" ] || die "could not determine the latest release tag."
+  # Fetch the whole API response first, THEN parse it. Piping curl straight into
+  # `grep -m1` makes grep close the pipe early; curl then dies on SIGPIPE and,
+  # under `set -o pipefail`, aborts the script — which surfaces to the outer
+  # `curl | bash` as "curl: (23) Failed writing body".
+  api_resp="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")" \
+    || die "could not reach the GitHub API (network, or rate limit — set KROT_VERSION=vX.Y.Z to skip)."
+  VERSION="$(printf '%s\n' "$api_resp" | grep '"tag_name"' | head -n1 | cut -d'"' -f4)"
+  [ -n "$VERSION" ] || die "could not determine the latest release tag (no release published yet?)."
 fi
 say "Installing krotVPN $VERSION (linux/$ARCH)"
 
