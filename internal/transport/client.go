@@ -32,11 +32,28 @@ type ClientConfig struct {
 	Pad          frame.PadPolicy
 }
 
-// Dial opens a bonded tunnel: it brings up the first channel (which carries the
-// address assignment), then opens the remaining channels in parallel, all
-// sharing one session id so the server groups them into a single logical link.
-// The tunnel is usable as long as at least one channel comes up; extra channels
-// that fail to connect are simply skipped (degraded bandwidth, not failure).
+const (
+	// redialMin / redialMax bound the backoff between attempts to (re)open a
+	// channel; a channel that was up and died is redialed after redialMin.
+	redialMin = 500 * time.Millisecond
+	redialMax = 15 * time.Second
+	// emptyGrace is how long a client tunnel may have no channel at all before
+	// it gives up (Run returns and systemd restarts the client from scratch).
+	emptyGrace = 45 * time.Second
+)
+
+// Dial opens a bonded tunnel. Every channel is dialed in parallel and Dial
+// returns as soon as the first one is up (that response carries the address
+// assignment); the rest attach as they connect. Each channel then has its own
+// maintainer that redials it whenever it dies — with a fresh TCP connection,
+// since on lossy paths a stalled flow rarely recovers while a new one usually
+// works. All channels share one session id, so the server groups them (and
+// rejoining channels) into a single logical link with one address.
+//
+// Dial fails only if the first attempt of every channel fails. The returned
+// tunnel stays usable while channels come and go; it dies when it has had no
+// channel for emptyGrace, or when the server answers a redial with a different
+// address (the session expired on the server and a new one was created).
 func Dial(cfg ClientConfig) (*Tunnel, *Assignment, error) {
 	n := cfg.Channels
 	if n < 1 {
@@ -51,43 +68,120 @@ func Dial(cfg ClientConfig) (*Tunnel, *Assignment, error) {
 		return nil, nil, err
 	}
 
-	// Channel 0 first — it returns the address assignment and confirms auth.
-	c0, assign, err := dialChannel(cfg, sid[:], 0)
-	if err != nil {
-		return nil, nil, fmt.Errorf("channel 0: %w", err)
-	}
-
 	tun := newTunnel(nil)
-	tun.addChannel(0, c0)
+	tun.persistent = true
+	tun.label = "krot"
 
-	// Remaining channels in parallel; failures are tolerated.
-	if n > 1 {
-		type res struct {
-			idx  int
-			conn *Conn
+	first := make(chan dialResult, n) // each maintainer reports its first attempt
+	for slot := 0; slot < n; slot++ {
+		go tun.maintain(cfg, sid[:], slot, n, first)
+	}
+	var assign *Assignment
+	var firstErr error
+	for i := 0; i < n && assign == nil; i++ {
+		r := <-first
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
 		}
-		ch := make(chan res, n-1)
-		for i := 1; i < n; i++ {
-			go func(idx int) {
-				c, _, err := dialChannel(cfg, sid[:], idx)
-				if err != nil {
-					log.Printf("bond channel %d failed: %v", idx, err)
-					ch <- res{idx, nil}
-					return
-				}
-				ch <- res{idx, c}
-			}(i)
+		assign = r.assign
+	}
+	if assign == nil {
+		tun.Close()
+		return nil, nil, fmt.Errorf("no channel came up: %w", firstErr)
+	}
+	go tun.watchEmpty(emptyGrace)
+
+	log.Printf("bonded tunnel up: %d/%d channels (rest connecting in background)", tun.channelCount(), n)
+	return tun, assign, nil
+}
+
+type dialResult struct {
+	assign *Assignment
+	err    error
+}
+
+// wireIndex is the channel index sent to the server for a slot's gen-th
+// connection. It rotates through slot, slot+n, slot+2n, … (< the session cap)
+// so a redial does not reuse the index of a predecessor an older server may
+// still hold, while staying ≡ slot mod n — slots never collide.
+func wireIndex(slot, n, gen int) int {
+	return slot + n*(gen%(maxChannelsPerSession/n))
+}
+
+// maintain keeps one channel slot connected for the tunnel's lifetime.
+func (t *Tunnel) maintain(cfg ClientConfig, sid []byte, slot, n int, first chan<- dialResult) {
+	backoff := redialMin
+	reported := false
+	for gen := 0; !t.isClosed(); gen++ {
+		c, a, err := dialChannel(cfg, sid, wireIndex(slot, n, gen))
+		if !reported {
+			first <- dialResult{a, err}
+			reported = true
 		}
-		for i := 1; i < n; i++ {
-			r := <-ch
-			if r.conn != nil {
-				tun.addChannel(r.idx, r.conn)
+		if err != nil {
+			log.Printf("krot: channel %d dial failed: %v (retry in %s)", slot, err, backoff)
+			if !t.sleep(backoff) {
+				return
+			}
+			backoff = min(backoff*2, redialMax)
+			continue
+		}
+		if !t.claimAddr(a.Addr) {
+			log.Printf("krot: server assigned %s on rejoin, session had %s: session expired, restarting", a.Addr, t.addr)
+			c.Close()
+			t.Close()
+			return
+		}
+		done := t.addChannel(slot, c)
+		if gen > 0 {
+			log.Printf("krot: channel %d up again (%d live)", slot, t.channelCount())
+		}
+		backoff = redialMin
+		<-done
+		if !t.sleep(redialMin) {
+			return
+		}
+	}
+}
+
+// claimAddr records the session address on the first successful channel and
+// reports whether a later channel's assignment still matches it.
+func (t *Tunnel) claimAddr(addr string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.addr == "" {
+		t.addr = addr
+		return true
+	}
+	return t.addr == addr
+}
+
+// watchEmpty closes the tunnel once it has had no channel for grace.
+func (t *Tunnel) watchEmpty(grace time.Duration) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	var since time.Time
+	for {
+		select {
+		case <-t.dead:
+			return
+		case now := <-tick.C:
+			if t.channelCount() > 0 {
+				since = time.Time{}
+				continue
+			}
+			if since.IsZero() {
+				since = now
+			} else if now.Sub(since) >= grace {
+				log.Printf("krot: no channel for %s, giving up", grace)
+				t.Close()
+				return
 			}
 		}
 	}
-
-	log.Printf("bonded tunnel up: %d/%d channels", tun.channelCount(), n)
-	return tun, assign, nil
 }
 
 // dialChannel performs one channel's full handshake: TCP, uTLS (Chrome), the
@@ -98,6 +192,7 @@ func dialChannel(cfg ClientConfig, sid []byte, chanIdx int) (*Conn, *Assignment,
 	if err != nil {
 		return nil, nil, fmt.Errorf("tcp dial: %w", err)
 	}
+	setUserTimeout(raw, TCPUserTimeout)
 
 	uconf := &utls.Config{
 		ServerName:         cfg.SNI,

@@ -125,7 +125,7 @@ func (s *Server) Run() error {
 	// transport. Using http.Server.ListenAndServeTLS instead re-adds "h2" to
 	// the ALPN list, after which net/http silently drops the negotiated-h2
 	// connection (no h2 handler is registered) and the client sees EOF.
-	return srv.Serve(tls.NewListener(ln, tlsCfg))
+	return srv.Serve(tls.NewListener(transport.WrapListener(ln), tlsCfg))
 }
 
 // Close tears down OS-level state.
@@ -181,7 +181,7 @@ func (s *Server) handleConn(tun *transport.Tunnel, assign transport.Assignment) 
 }
 
 func keepalive(tun *transport.Tunnel, stop chan struct{}) {
-	t := time.NewTicker(20 * time.Second)
+	t := time.NewTicker(transport.KeepaliveInterval)
 	defer t.Stop()
 	for {
 		select {

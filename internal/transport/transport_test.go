@@ -324,9 +324,7 @@ func TestBondedTunnelRoundTrip(t *testing.T) {
 	if assign.Addr != "10.8.0.2/24" {
 		t.Fatalf("unexpected assignment: %+v", assign)
 	}
-	if n := tun.channelCount(); n != 4 {
-		t.Fatalf("expected 4 channels, got %d", n)
-	}
+	waitChannels(t, tun, 4, 5*time.Second)
 
 	// Send many packets; echo must return all of them (order may differ across
 	// channels, so match by a per-packet id, not by sequence).
@@ -380,6 +378,7 @@ func TestBondSurvivesChannelLoss(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer tun.Close()
+	waitChannels(t, tun, 4, 5*time.Second)
 
 	// Forcibly drop 3 of the 4 channels by closing their conns directly.
 	tun.mu.Lock()
@@ -413,5 +412,262 @@ func TestBondSurvivesChannelLoss(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no echo after channel loss")
+	}
+}
+
+// waitChannels waits until the tunnel has exactly want channels attached.
+func waitChannels(t *testing.T, tun *Tunnel, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		n := tun.channelCount()
+		if n == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d channels, have %d after %s", want, n, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// reader drains a tunnel into a channel for the rest of the test (one reader
+// per tunnel: a second concurrent ReadPacket caller would steal packets).
+func reader(tun *Tunnel) <-chan []byte {
+	ch := make(chan []byte, 64)
+	go func() {
+		for {
+			p, err := tun.ReadPacket()
+			if err != nil {
+				close(ch)
+				return
+			}
+			ch <- p
+		}
+	}()
+	return ch
+}
+
+// echoOnce sends a marked packet (resending every 200 ms, since one written
+// onto a channel that is just dying is lost like on a real link) until the
+// echo comes back.
+func echoOnce(t *testing.T, tun *Tunnel, in <-chan []byte, mark byte) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if err := tun.WritePacket([]byte{0x01, 0x02, mark}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		select {
+		case p := <-in:
+			if len(p) == 3 && p[2] == mark {
+				return
+			}
+		case <-tick.C:
+		case <-deadline:
+			t.Fatalf("no echo for mark %#x", mark)
+		}
+	}
+}
+
+// waitBelow waits until fewer than n channels are attached.
+func waitBelow(t *testing.T, tun *Tunnel, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for tun.channelCount() >= n {
+		if time.Now().After(deadline) {
+			t.Fatalf("channels did not drop below %d", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// killChannels closes the conns of up to k attached channels (k<0: all), as a
+// stalled TCP connection being killed by TCP_USER_TIMEOUT would.
+func killChannels(tun *Tunnel, k int) {
+	tun.mu.Lock()
+	defer tun.mu.Unlock()
+	for _, c := range tun.channels {
+		if k == 0 {
+			return
+		}
+		c.c.Close()
+		k--
+	}
+}
+
+// TestChannelsRedialAfterLoss: channels that die are redialed and rejoin the
+// same session, so the tunnel returns to full strength without a restart.
+func TestChannelsRedialAfterLoss(t *testing.T) {
+	psk := make([]byte, crypto.KeySize)
+	crypto.Random(psk)
+	addr, pub := startServer(t, psk, nil)
+
+	tun, _, err := Dial(ClientConfig{
+		ServerAddr: addr, SNI: "localhost", Path: "/api/v2/stream",
+		PSK: psk, ServerStatic: pub, Insecure: true, Channels: 4,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tun.Close()
+	waitChannels(t, tun, 4, 5*time.Second)
+	in := reader(tun)
+
+	for round := 0; round < 5; round++ { // several generations exercise wireIndex rotation
+		killChannels(tun, 3)
+		waitBelow(t, tun, 4)
+		waitChannels(t, tun, 4, 5*time.Second)
+		echoOnce(t, tun, in, byte(0xD0+round))
+	}
+}
+
+// TestTunnelSurvivesLosingAllChannels: a client tunnel with no channel left
+// stays open (dropping packets) while its maintainers redial, then carries
+// traffic again.
+func TestTunnelSurvivesLosingAllChannels(t *testing.T) {
+	psk := make([]byte, crypto.KeySize)
+	crypto.Random(psk)
+	addr, pub := startServer(t, psk, nil)
+
+	tun, _, err := Dial(ClientConfig{
+		ServerAddr: addr, SNI: "localhost", Path: "/api/v2/stream",
+		PSK: psk, ServerStatic: pub, Insecure: true, Channels: 2,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tun.Close()
+	waitChannels(t, tun, 2, 5*time.Second)
+	in := reader(tun)
+
+	killChannels(tun, -1)
+	waitBelow(t, tun, 1)
+	if err := tun.WritePacket([]byte{0x01, 0x02, 0x00}); err != nil {
+		t.Fatalf("write while redialing must not fail: %v", err)
+	}
+	if tun.isClosed() {
+		t.Fatal("tunnel died with its channels")
+	}
+	waitChannels(t, tun, 2, 5*time.Second)
+	echoOnce(t, tun, in, 0xE2)
+}
+
+// TestRejoinWithNewAddressClosesTunnel: if the server lost the session and
+// hands a redialed channel a different address, the tunnel must die so the
+// client restarts with the new address instead of sending from the old one.
+func TestRejoinWithNewAddressClosesTunnel(t *testing.T) {
+	psk := make([]byte, crypto.KeySize)
+	crypto.Random(psk)
+	static, err := crypto.GenerateKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	next := 2
+	handler, err := NewHandler(HandlerConfig{
+		PSK: psk, Static: static, Path: "/api/v2/stream", Gw: "10.8.0.1",
+		Alloc: func() (string, func(), bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			a := next
+			next++
+			return "10.8.0." + string(rune('0'+a)) + "/24", func() {}, true
+		},
+		OnConn: func(c *Tunnel, _ Assignment) {
+			for {
+				if _, err := c.ReadPacket(); err != nil {
+					return
+				}
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		Handler:      handler,
+		TLSConfig:    &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"http/1.1"}, Certificates: []tls.Certificate{genCert(t)}},
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
+	}
+	go srv.ServeTLS(ln, "", "")
+	defer func() { srv.Close(); ln.Close() }()
+
+	tun, assign, err := Dial(ClientConfig{
+		ServerAddr: ln.Addr().String(), SNI: "localhost", Path: "/api/v2/stream",
+		PSK: psk, ServerStatic: static.Public, Insecure: true, Channels: 1,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tun.Close()
+	if assign.Addr != "10.8.0.2/24" {
+		t.Fatalf("unexpected first address %s", assign.Addr)
+	}
+	waitChannels(t, tun, 1, 5*time.Second)
+
+	// Killing the only channel empties the server session; the rejoin creates
+	// a new one with the next address.
+	killChannels(tun, -1)
+	select {
+	case <-tun.dead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel kept running after the server changed its address")
+	}
+}
+
+// TestReplacementKeepsFlowPositions: replacing one channel must not move the
+// flows pinned to the others (a reshuffle would reorder every inner flow).
+func TestReplacementKeepsFlowPositions(t *testing.T) {
+	psk := make([]byte, crypto.KeySize)
+	crypto.Random(psk)
+	addr, pub := startServer(t, psk, nil)
+
+	tun, _, err := Dial(ClientConfig{
+		ServerAddr: addr, SNI: "localhost", Path: "/api/v2/stream",
+		PSK: psk, ServerStatic: pub, Insecure: true, Channels: 4,
+	})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer tun.Close()
+	waitChannels(t, tun, 4, 5*time.Second)
+
+	tun.mu.Lock()
+	before := append([]int(nil), tun.slots...)
+	victim := tun.channels[before[1]]
+	others := map[int]*channel{}
+	for _, p := range []int{0, 2, 3} {
+		others[p] = tun.channels[before[p]]
+	}
+	tun.mu.Unlock()
+
+	victim.c.Close()
+	waitBelow(t, tun, 4)
+	tun.mu.Lock()
+	if tun.slots[1] != -1 {
+		t.Fatalf("dead channel's position not emptied: %v", tun.slots)
+	}
+	tun.mu.Unlock()
+	waitChannels(t, tun, 4, 5*time.Second)
+
+	tun.mu.Lock()
+	defer tun.mu.Unlock()
+	if len(tun.slots) != 4 {
+		t.Fatalf("positions grew: %v", tun.slots)
+	}
+	for p, ch := range others {
+		if tun.channels[tun.slots[p]] != ch {
+			t.Fatalf("position %d changed channel after an unrelated replacement", p)
+		}
+	}
+	if tun.channels[tun.slots[1]] == victim {
+		t.Fatal("dead channel still in place")
 	}
 }

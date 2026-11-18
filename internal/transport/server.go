@@ -116,6 +116,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Look up an existing bonded session for this sid, or reserve an address
 	// and create one. Only the FIRST channel of a session allocates an address;
 	// later channels join the existing tunnel.
+	var tunRef *Tunnel // the tunnel this request created, if any
 	h.mu.Lock()
 	sess, joining := h.sessions[sidKey]
 	if !joining {
@@ -129,10 +130,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// onEmpty fires once when the last channel leaves: free addr + unregister.
 		tun := newTunnel(func() {
 			h.mu.Lock()
-			delete(h.sessions, sidKey)
+			if h.sessions[sidKey] != nil && h.sessions[sidKey].tun == tunRef {
+				delete(h.sessions, sidKey)
+			}
 			h.mu.Unlock()
 			release()
 		})
+		tunRef = tun
+		tun.label = "krot: session " + cidr
 		sess = &serverSession{tun: tun, assign: assign}
 		h.sessions[sidKey] = sess
 		h.mu.Unlock()
@@ -149,6 +154,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.mu.Unlock()
 	}
+
+	// If this request created the session but its channel never attaches, the
+	// session would hold its address forever (onEmpty fires only when a
+	// channel leaves). Drop it unless a sibling channel joined meanwhile.
+	attached := false
+	defer func() {
+		if !attached && tunRef != nil && tunRef.channelCount() == 0 {
+			tunRef.Close()
+		}
+	}()
 
 	eph, err := crypto.GenerateKeypair()
 	if err != nil {
@@ -185,6 +200,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Attach to the bonded tunnel and block until THIS channel dies, so the
 	// HTTP/WebSocket goroutine lives exactly as long as its connection.
 	done := sess.tun.addChannel(chanIdx, conn)
+	attached = true
 	<-done
 }
 

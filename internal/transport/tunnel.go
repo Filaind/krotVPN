@@ -2,6 +2,8 @@ package transport
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,14 +54,24 @@ func (ch *channel) requestStop() { ch.stopOnce.Do(func() { close(ch.stop) }) }
 // code simple. (Channels should have similar RTT so cross-channel reorder
 // stays small; in practice they share a path to the same server.)
 //
-// A Tunnel is alive while it has ≥1 channel. Losing channels degrades
-// bandwidth but does not drop the tunnel; the last channel leaving tears it
-// down and fires onEmpty exactly once.
+// A server Tunnel is alive while it has ≥1 channel: losing channels degrades
+// bandwidth, the last channel leaving tears it down and fires onEmpty exactly
+// once. A client Tunnel is persistent: it survives having no channels while its
+// maintainers redial (packets are dropped meanwhile) and dies only on Close.
 type Tunnel struct {
 	mu       sync.Mutex
 	channels map[int]*channel
-	order    []int // active channel indices, indexed by flow hash
-	closed   bool
+	// slots maps flow-hash positions to channel indices (-1 = empty). A dead
+	// channel leaves its position empty and its replacement takes the first
+	// empty one, so losing or replacing a channel moves only the flows that
+	// were on it; flows on an empty position borrow a live one meanwhile.
+	slots      []int
+	live       []int // positions in slots that hold a channel
+	pos        map[int]int
+	closed     bool
+	persistent bool   // client side: stay open with zero channels
+	label      string // log prefix for channel up/down; "" = silent
+	addr       string // client side: the session's assigned address
 
 	inbound  chan []byte
 	dead     chan struct{}
@@ -72,6 +84,7 @@ type Tunnel struct {
 func newTunnel(onEmpty func()) *Tunnel {
 	return &Tunnel{
 		channels: make(map[int]*channel),
+		pos:      make(map[int]int),
 		inbound:  make(chan []byte, 4096),
 		dead:     make(chan struct{}),
 		onEmpty:  onEmpty,
@@ -97,12 +110,74 @@ func (t *Tunnel) addChannel(idx int, c *Conn) <-chan struct{} {
 		stop:    make(chan struct{}),
 		flushed: make(chan struct{}),
 	}
+	// A client redialing a channel can reach us before we noticed the old one
+	// died (its TCP may still be stuck in retransmits): the new conn replaces
+	// it under the same index.
+	old := t.channels[idx]
 	t.channels[idx] = ch
-	t.order = append(t.order, idx)
+	if old == nil {
+		t.place(idx)
+	}
 	t.mu.Unlock()
+	if old != nil {
+		old.requestStop()
+		old.c.Close()
+		if t.label != "" {
+			log.Printf("%s: channel %d replaced by a new connection", t.label, idx)
+		}
+	}
 	go t.readLoop(idx, ch, done)
 	go t.writeLoop(idx, ch)
+	go t.healthLoop(idx, ch)
 	return done
+}
+
+// place puts idx into the first empty flow-hash position. Caller holds mu.
+func (t *Tunnel) place(idx int) {
+	p := -1
+	for i, v := range t.slots {
+		if v < 0 {
+			p = i
+			break
+		}
+	}
+	if p < 0 {
+		p = len(t.slots)
+		t.slots = append(t.slots, idx)
+	} else {
+		t.slots[p] = idx
+	}
+	t.pos[idx] = p
+	t.rebuildLive()
+}
+
+// rebuildLive recomputes the filled positions. Caller holds mu.
+func (t *Tunnel) rebuildLive() {
+	t.live = t.live[:0]
+	for i, v := range t.slots {
+		if v >= 0 {
+			t.live = append(t.live, i)
+		}
+	}
+}
+
+// healthLoop replaces a channel whose TCP connection is stuck retransmitting:
+// on paths where individual flows stall while fresh ones pass, waiting for
+// TCPUserTimeout would hold every flow pinned to it for 10 s.
+func (t *Tunnel) healthLoop(idx int, ch *channel) {
+	tick := time.NewTicker(healthInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ch.stop:
+			return
+		case <-tick.C:
+			if b := rtoBackoff(ch.c.tcp); b >= stuckBackoff {
+				t.removeChannel(idx, ch, fmt.Errorf("stuck: %d retransmission timeouts in a row", b))
+				return
+			}
+		}
+	}
 }
 
 func (t *Tunnel) readLoop(idx int, ch *channel, done chan struct{}) {
@@ -110,7 +185,7 @@ func (t *Tunnel) readLoop(idx int, ch *channel, done chan struct{}) {
 	for {
 		p, err := ch.c.ReadPacket()
 		if err != nil {
-			t.removeChannel(idx)
+			t.removeChannel(idx, ch, err)
 			return
 		}
 		select {
@@ -142,7 +217,7 @@ func (t *Tunnel) writeLoop(idx int, ch *channel) {
 			batch = append(batch[:0], p)
 			drain()
 			if err := ch.c.writeBatch(batch); err != nil {
-				t.removeChannel(idx)
+				t.removeChannel(idx, ch, err)
 				return
 			}
 		case <-ch.stop:
@@ -160,27 +235,31 @@ func (t *Tunnel) writeLoop(idx int, ch *channel) {
 	}
 }
 
-func (t *Tunnel) removeChannel(idx int) {
+// removeChannel detaches ch if it is still the channel at idx (a replaced or
+// already-removed channel is a no-op), stops it, and — on a non-persistent
+// tunnel — tears the tunnel down when it was the last one.
+func (t *Tunnel) removeChannel(idx int, ch *channel, cause error) {
 	t.mu.Lock()
-	ch, ok := t.channels[idx]
-	if !ok {
+	if t.channels[idx] != ch {
 		t.mu.Unlock()
 		return
 	}
 	delete(t.channels, idx)
-	out := t.order[:0]
-	for _, i := range t.order {
-		if i != idx {
-			out = append(out, i)
-		}
+	if p, ok := t.pos[idx]; ok {
+		t.slots[p] = -1
+		delete(t.pos, idx)
+		t.rebuildLive()
 	}
-	t.order = out
-	empty := len(t.channels) == 0
+	live := len(t.channels)
+	closed := t.closed
 	t.mu.Unlock()
 
 	ch.requestStop()
 	ch.c.Close()
-	if empty {
+	if t.label != "" && !closed {
+		log.Printf("%s: channel %d down: %v (%d live)", t.label, idx, cause, live)
+	}
+	if live == 0 && !t.persistent {
 		t.markDead()
 	}
 }
@@ -215,17 +294,28 @@ func (t *Tunnel) Dropped() uint64 { return t.dropped.Load() }
 // preserved. This is the layer3+4 hashing policy used by Linux bonding / ECMP.
 //
 // It never blocks: a full queue drops the packet (counted in Dropped) and the
-// inner TCP retransmits it. It errors only when no channel is left. The caller
-// must not modify p afterwards — the queue holds it until the writer sends it.
+// inner TCP retransmits it. With no channel attached the packet is dropped too
+// on a persistent tunnel that is redialing; it errors only once the tunnel is
+// dead. The caller must not modify p afterwards — the queue holds it until the
+// writer sends it.
 func (t *Tunnel) WritePacket(p []byte) error {
 	h := flowHash(p)
 	t.mu.Lock()
-	n := len(t.order)
+	n := len(t.live)
 	if n == 0 {
+		closed := t.closed || !t.persistent
 		t.mu.Unlock()
-		return errTunnelClosed
+		if closed {
+			return errTunnelClosed
+		}
+		t.dropped.Add(1)
+		return nil
 	}
-	ch := t.channels[t.order[h%uint32(n)]]
+	idx := t.slots[h%uint32(len(t.slots))]
+	if idx < 0 {
+		idx = t.slots[t.live[h%uint32(n)]]
+	}
+	ch := t.channels[idx]
 	t.mu.Unlock()
 
 	select {
@@ -275,18 +365,23 @@ func flowHash(p []byte) uint32 {
 // own to stay off the idle/NAT timeout and to refresh its read deadline).
 func (t *Tunnel) WriteKeepalive() error {
 	t.mu.Lock()
-	idxs := append([]int(nil), t.order...)
-	cs := make([]*channel, len(idxs))
-	for i, idx := range idxs {
-		cs[i] = t.channels[idx]
+	idxs := make([]int, 0, len(t.channels))
+	cs := make([]*channel, 0, len(t.channels))
+	for idx, ch := range t.channels {
+		idxs = append(idxs, idx)
+		cs = append(cs, ch)
 	}
+	closed := t.closed || !t.persistent
 	t.mu.Unlock()
 	if len(cs) == 0 {
-		return errTunnelClosed
+		if closed {
+			return errTunnelClosed
+		}
+		return nil // persistent tunnel between channels: maintainers redial
 	}
 	for i, ch := range cs {
 		if err := ch.c.WriteKeepalive(); err != nil {
-			t.removeChannel(idxs[i])
+			t.removeChannel(idxs[i], ch, err)
 		}
 	}
 	return nil
@@ -308,16 +403,39 @@ func (t *Tunnel) ReadPacket() ([]byte, error) {
 	}
 }
 
+// isClosed reports whether the tunnel has been torn down.
+func (t *Tunnel) isClosed() bool {
+	select {
+	case <-t.dead:
+		return true
+	default:
+		return false
+	}
+}
+
+// sleep waits d, returning false early if the tunnel dies meanwhile.
+func (t *Tunnel) sleep(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-t.dead:
+		return false
+	}
+}
+
 // Close flushes queued packets (bounded by closeFlushTimeout), then tears down
 // all channels and the tunnel.
 func (t *Tunnel) Close() error {
 	t.mu.Lock()
+	t.closed = true // from here on addChannel refuses new conns
 	chans := make([]*channel, 0, len(t.channels))
 	for _, ch := range t.channels {
 		chans = append(chans, ch)
 	}
 	t.channels = make(map[int]*channel)
-	t.order = nil
+	t.slots, t.live, t.pos = nil, nil, make(map[int]int)
 	t.mu.Unlock()
 
 	for _, ch := range chans {

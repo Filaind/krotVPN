@@ -182,7 +182,7 @@ func Run(ctx context.Context, cfg *config.Client) error {
 }
 
 func keepalive(conn *transport.Tunnel, stop chan struct{}) {
-	t := time.NewTicker(20 * time.Second)
+	t := time.NewTicker(transport.KeepaliveInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -190,8 +190,9 @@ func keepalive(conn *transport.Tunnel, stop chan struct{}) {
 			return
 		case <-t.C:
 			if err := conn.WriteKeepalive(); err != nil {
-				// Tear the tunnel down so the read/write pumps error out and
-				// Run() returns — letting systemd restart a dead client.
+				// Only a dead tunnel errors here (channels that fail are
+				// redialed by the tunnel itself). Tear it down so the pumps
+				// error out and Run() returns — letting systemd restart us.
 				conn.Close()
 				return
 			}

@@ -15,13 +15,28 @@ import (
 )
 
 const (
-	// readTimeout bounds how long ReadPacket waits for any frame. Both peers
-	// send a keepalive every ~20s, so a healthy tunnel refreshes the deadline
-	// well within this window; a peer that vanishes without TCP RST/FIN (mobile
-	// drop, NAT timeout) makes ReadPacket error out instead of blocking forever,
-	// so handleConn returns and frees its pool address. Must be comfortably
-	// larger than the keepalive interval to tolerate a couple of missed beats.
-	readTimeout = 60 * time.Second
+	// KeepaliveInterval is how often each side sends a padding record on every
+	// channel. Besides keeping NAT state warm, it guarantees each socket always
+	// has fresh unacknowledged data, so TCPUserTimeout notices a stuck channel
+	// in either direction (lost data or lost ACKs) within seconds.
+	KeepaliveInterval = 5 * time.Second
+	// TCPUserTimeout is how long sent data may stay unacknowledged before the
+	// kernel kills the channel's TCP connection (TCP_USER_TIMEOUT, Linux). On
+	// paths where some flows stall for minutes while fresh ones work, a channel
+	// stuck in retransmission backoff is worth less than a new one; the client
+	// redials it right away.
+	TCPUserTimeout = 10 * time.Second
+	// stuckBackoff: a channel whose head segment has been retransmitted on
+	// timeout this many times in a row (≈2–3 s without any ACK at usual RTTs)
+	// is replaced. On a healthy path one loss is repaired by SACK long before;
+	// three timeouts in a row mean this flow's path is broken. Checked every
+	// healthInterval.
+	stuckBackoff   = 3
+	healthInterval = 500 * time.Millisecond
+	// readTimeout bounds how long ReadPacket waits for any frame — the backstop
+	// for a peer whose kernel still ACKs but whose process stopped sending.
+	// Peers keepalive every 5 s (20 s before v1.2), so 30 s spares a few beats.
+	readTimeout = 30 * time.Second
 	// writeTimeout bounds a single batch write so a stuck socket cannot wedge a
 	// writer goroutine while holding wmu.
 	writeTimeout = 15 * time.Second
@@ -58,8 +73,9 @@ var errMsgTooBig = errors.New("krot: websocket message exceeds read buffer")
 // reset.)
 type Conn struct {
 	ws       *websocket.Conn
-	raw      net.Conn // the TLS connection under ws
-	isClient bool     // client→server frames must be masked
+	raw      net.Conn     // the TLS connection under ws
+	tcp      *net.TCPConn // the TCP socket under that (health checks); may be nil
+	isClient bool         // client→server frames must be masked
 	seal     *frame.Sealer
 	open     *frame.Opener
 
@@ -81,11 +97,27 @@ func newConn(ws *websocket.Conn, sealKey, openKey []byte, pad frame.PadPolicy, i
 	maxMsg := frame.MaxPayload + 2048
 	ws.SetReadLimit(int64(maxMsg))
 	return &Conn{
-		ws: ws, raw: ws.UnderlyingConn(), isClient: isClient,
+		ws: ws, raw: ws.UnderlyingConn(), tcp: tcpOf(ws.UnderlyingConn()), isClient: isClient,
 		seal: s, open: o,
 		wbuf: make([]byte, 0, flushBytes+frame.MaxPayload+2048+wsMaxHeader),
 		rbuf: make([]byte, maxMsg),
 	}, nil
+}
+
+// tcpOf unwraps TLS layers (crypto/tls and uTLS both expose NetConn) down to
+// the TCP socket.
+func tcpOf(c net.Conn) *net.TCPConn {
+	for i := 0; i < 4 && c != nil; i++ {
+		switch v := c.(type) {
+		case *net.TCPConn:
+			return v
+		case interface{ NetConn() net.Conn }:
+			c = v.NetConn()
+		default:
+			return nil
+		}
+	}
+	return nil
 }
 
 // wsHeader appends an RFC 6455 FIN+binary frame header for a payload of n
