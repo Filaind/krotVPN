@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	mrand "math/rand/v2"
+	"slices"
 
 	"github.com/krot-vpn/krot/internal/crypto"
 )
@@ -122,10 +123,52 @@ func (s *Sealer) Seal(typ byte, payload []byte) ([]byte, error) {
 	return s.aead.Seal(nil, plain)
 }
 
+// AppendSealed is Seal without intermediate allocations: it appends to dst the
+// transport header produced by hdr (given the final ciphertext length, which
+// the transport needs up front for its own length field) followed by the
+// sealed record, encrypting in place. The record bytes are identical to Seal's.
+func (s *Sealer) AppendSealed(dst []byte, typ byte, payload []byte, hdr func(dst []byte, ctLen int) []byte) ([]byte, error) {
+	if len(payload) > MaxPayload {
+		return nil, errBig
+	}
+	pad := s.padFor(len(payload))
+	plainLen := headerLen + len(payload) + pad
+	dst = hdr(dst, plainLen+s.aead.Overhead())
+	// Room for plaintext + tag, so the in-place Seal below never reallocates
+	// (a reallocating Seal would leave its output outside dst).
+	dst = slices.Grow(dst, plainLen+s.aead.Overhead())
+
+	start := len(dst)
+	dst = append(dst, typ, byte(len(payload)>>8), byte(len(payload)))
+	dst = append(dst, payload...)
+	if pad > 0 {
+		n := len(dst)
+		dst = dst[:n+pad]
+		crypto.Random(dst[n:])
+	}
+	s.count++
+	// Seal in place: output overwrites the plaintext at dst[start:] exactly.
+	out, err := s.aead.Seal(dst[start:start], dst[start:])
+	if err != nil {
+		return nil, err
+	}
+	return dst[:start+len(out)], nil
+}
+
 // Open decrypts one record and returns its type and payload (a fresh copy is
 // not made; callers using the payload past the next Open must copy it).
 func (o *Opener) Open(ciphertext []byte) (typ byte, payload []byte, err error) {
-	plain, err := o.aead.Open(nil, ciphertext)
+	return o.open(nil, ciphertext)
+}
+
+// OpenInPlace is Open decrypting over the ciphertext's own storage, so the
+// returned payload aliases ciphertext.
+func (o *Opener) OpenInPlace(ciphertext []byte) (typ byte, payload []byte, err error) {
+	return o.open(ciphertext[:0], ciphertext)
+}
+
+func (o *Opener) open(dst, ciphertext []byte) (typ byte, payload []byte, err error) {
+	plain, err := o.aead.Open(dst, ciphertext)
 	if err != nil {
 		return 0, nil, err
 	}

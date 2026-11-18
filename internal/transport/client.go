@@ -170,7 +170,7 @@ func dialChannel(cfg ClientConfig, sid []byte, chanIdx int) (*Conn, *Assignment,
 	if pad.BurstRecords == 0 && pad.BurstMax == 0 {
 		pad = frame.DefaultPad
 	}
-	conn, err := newConn(ws, keys.TxKey, keys.RxKey, pad)
+	conn, err := newConn(ws, keys.TxKey, keys.RxKey, pad, true)
 	if err != nil {
 		ws.Close()
 		return nil, nil, err

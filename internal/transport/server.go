@@ -176,7 +176,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	keys := crypto.DeriveSessionKeys(shared, channelSalt(clientEph, eph.Public, sid, chanIdx), false)
-	conn, err := newConn(ws, keys.TxKey, keys.RxKey, h.cfg.Pad)
+	conn, err := newConn(ws, keys.TxKey, keys.RxKey, h.cfg.Pad, false)
 	if err != nil {
 		ws.Close()
 		return

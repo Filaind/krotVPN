@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -192,17 +193,17 @@ func TestConcurrentWritersNoAEADDesync(t *testing.T) {
 	crypto.Random(psk)
 
 	const totalData = 4000
-	done := make(chan error, 1)
+	type result struct {
+		got int
+		err error
+	}
+	done := make(chan result, 1)
 	addr, pub := startServer(t, psk, func(c *Tunnel, _ Assignment) {
 		got := 0
 		for {
 			_, err := c.ReadPacket()
 			if err != nil {
-				if got >= totalData {
-					done <- nil
-				} else {
-					done <- err
-				}
+				done <- result{got, err}
 				return
 			}
 			got++
@@ -249,12 +250,18 @@ func TestConcurrentWritersNoAEADDesync(t *testing.T) {
 	}
 	wg.Wait()
 	close(stopKA)
-	conn.Close()
+	conn.Close() // flushes the channel queue before closing
 
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("server side error (AEAD desync?): %v", err)
+	case r := <-done:
+		// An AEAD desync surfaces as an authentication failure before the
+		// clean close; a tunnel that stays in sync delivers every packet that
+		// was not tail-dropped on the (never-blocking) send queue.
+		if r.err != nil && strings.Contains(r.err.Error(), "authentication") {
+			t.Fatalf("server side AEAD desync: %v", r.err)
+		}
+		if dropped := int(conn.Dropped()); r.got+dropped != totalData {
+			t.Fatalf("server got %d + dropped %d != sent %d (last err: %v)", r.got, dropped, totalData, r.err)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("timeout waiting for server to drain")
@@ -382,7 +389,7 @@ func TestBondSurvivesChannelLoss(t *testing.T) {
 			break
 		}
 		_ = idx
-		c.Close()
+		c.c.Close()
 		killed++
 	}
 	tun.mu.Unlock()
