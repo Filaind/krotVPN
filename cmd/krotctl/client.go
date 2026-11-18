@@ -121,6 +121,7 @@ func clientUp(args []string) error {
 		return err
 	}
 	fmt.Printf("installed %s\n", clientUnitTemplatePath)
+	applyTCPTuning()
 
 	if *noStart {
 		fmt.Printf("(-no-start) start later: systemctl start %s\n", clientUnit(*name))

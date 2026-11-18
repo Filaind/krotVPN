@@ -111,6 +111,7 @@ func serverUp(args []string) error {
 		return err
 	}
 	fmt.Printf("installed %s\n", serverUnitPath)
+	applyTCPTuning()
 
 	if *noStart {
 		fmt.Println("(-no-start) not starting; `systemctl start krot-server` when ready")

@@ -59,6 +59,7 @@ func cmdUninstall(args []string) error {
 	// --- remove systemd units ---
 	removeFile(serverUnitPath)
 	removeFile(clientUnitTemplatePath)
+	removeTCPTuning()
 	_ = sh("systemctl", "daemon-reload")
 	_ = sh("systemctl", "reset-failed")
 
